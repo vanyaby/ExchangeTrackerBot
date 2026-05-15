@@ -127,7 +127,7 @@ async def parse_with_groq(text):
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-7",
+                    "model": "claude-sonnet-4-6",
                     "max_tokens": 300,
                     "temperature": 0,
                     "system": SYSTEM_PROMPT + "\n\nВЕРНИ ТОЛЬКО JSON, БЕЗ ОБЪЯСНЕНИЙ И MARKDOWN.",
