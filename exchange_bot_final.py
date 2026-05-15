@@ -115,28 +115,28 @@ SYSTEM_PROMPT = """Ты парсер платёжных заявок. Возвр
 
 ФОРМАТ ОТВЕТА (строго):
 {"bank": string|null, "amount": number|null, "currency": "RUB", "card": string|null, "phone": string|null}"""
-
 async def parse_with_groq(text):
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                "https://api.groq.com/openai/v1/chat/completions",
                 headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-6",
+                    "model": "llama-3.3-70b-versatile",
                     "max_tokens": 300,
                     "temperature": 0,
-                    "system": SYSTEM_PROMPT + "\n\nВЕРНИ ТОЛЬКО JSON, БЕЗ ОБЪЯСНЕНИЙ И MARKDOWN.",
+                    "response_format": {"type": "json_object"},
                     "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT + "\n\nВЕРНИ ТОЛЬКО JSON, БЕЗ ОБЪЯСНЕНИЙ И MARKDOWN."},
                         {"role": "user", "content": re.sub(r" - ", " ", normalize_amount_spaces(text))}
                     ]
                 }
             )
-            raw = resp.json()["content"][0]["text"].strip()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+
             logger.info(f"Groq raw: {repr(raw)}")
             raw = re.sub(r"```json|```", "", raw).strip()
             # Вырезаем только JSON объект если есть лишний текст
