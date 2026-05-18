@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
-import logging
 import os
+import logging
 import asyncio
 import re
 import json
@@ -37,6 +37,7 @@ last_list_msg = {}  # chat_id -> message_id последнего /list (для �
 balance = {}  # chat_id -> остаток баланса в RUB (None = не задан)
 bot_msgs = {}     # chat_id -> [последние 3 message_id, отправленные ботом]
 topups = {}   # chat_id -> [{"date": str, "amount": int}] — история пополнений текущей сессии
+last_bulk_close = {}  # chat_id -> [id1, id2, ...] для кнопки "Отменить закрытие всех"
 
 def get_orders(chat_id):
     if chat_id not in orders:
@@ -58,14 +59,29 @@ def fmt_usd(val):
     return s + " USD"
 
 def _balance_line(chat_id):
-    bal = balance.get(chat_id)
-    if bal is None:
+    bal_usd = balance.get(chat_id)
+    if bal_usd is None:
         return ""
     rate = get_rate(chat_id)
-    bal_str = f"{int(bal):,}".replace(",", " ") + " ₽"
     if rate:
-        bal_str += f" / {fmt_usd(bal / rate)}"
+        rub = bal_usd * rate
+        rub_str = f"{int(rub):,}".replace(",", " ") + " ₽"
+        bal_str = f"{rub_str} / {fmt_usd(bal_usd)}"
+    else:
+        bal_str = fmt_usd(bal_usd)
     return f"💰 Баланс: {bal_str}\n"
+
+def _order_to_usd(order, default_rate):
+    amt = order.get("amount") or 0
+    cur = order.get("currency", "RUB")
+    r = order.get("close_rate") or default_rate
+    if not amt:
+        return 0
+    if cur in ("USDT", "USD", "USDC"):
+        return amt
+    if cur == "RUB" and r:
+        return amt / r
+    return 0
 
 def _format_topups_block(s):
     """Возвращает строки про пополнения и итоговый баланс из архивной сессии."""
@@ -115,28 +131,25 @@ SYSTEM_PROMPT = """Ты парсер платёжных заявок. Возвр
 
 ФОРМАТ ОТВЕТА (строго):
 {"bank": string|null, "amount": number|null, "currency": "RUB", "card": string|null, "phone": string|null}"""
+
 async def parse_with_groq(text):
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
                 json={
                     "model": "llama-3.3-70b-versatile",
-                    "max_tokens": 300,
                     "temperature": 0,
+                    "max_tokens": 300,
                     "response_format": {"type": "json_object"},
                     "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT + "\n\nВЕРНИ ТОЛЬКО JSON, БЕЗ ОБЪЯСНЕНИЙ И MARKDOWN."},
+                        {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": re.sub(r" - ", " ", normalize_amount_spaces(text))}
                     ]
                 }
             )
             raw = resp.json()["choices"][0]["message"]["content"].strip()
-
             logger.info(f"Groq raw: {repr(raw)}")
             raw = re.sub(r"```json|```", "", raw).strip()
             # Вырезаем только JSON объект если есть лишний текст
@@ -261,7 +274,7 @@ BANK_MAP = {
 _AMT_RE   = re.compile(r'(\d+[\.,]?\d*)\s*(?:т\.?\s*р\.?|тр\b|тыс)', re.IGNORECASE)
 _K_RE     = re.compile(r'(\d+[\.,]?\d*)\s*[кk]\b', re.IGNORECASE)
 _PHONE_RE = re.compile(r'\+\s*7[\s\-\(\)]*(\d[\s\-\(\)]*){10}|(?<!\d)8[\s\-\(\)]*(\d[\s\-\(\)]*){10}|(?<!\d)7\d{10}(?!\d)|(?<!\d)9\d{9}(?!\d)')
-_CARD_RE  = re.compile(r'\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}')
+_CARD_RE  = re.compile(r'(?<!\d)\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}(?!\d)')
 
 def normalize_amount_spaces(text):
     """Склеивает числа с пробелами как разделители тысяч: '5 600' → '5600'.
@@ -349,6 +362,21 @@ def is_multi_order(text):
         return True
     if len(amounts) >= 2 and text.count('\n') >= 2:
         return True
+    # Многострочное сообщение, где ≥2 строк выглядят как заявки
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if len(lines) >= 2:
+        signal = 0
+        for line in lines:
+            ll = line.lower()
+            has_bank  = any(k in ll for k in BANK_MAP)
+            has_num   = bool(re.search(r'\b\d{2,7}\b', line))
+            has_kamt  = bool(_K_RE.search(line) or _AMT_RE.search(line))
+            has_phone = bool(_PHONE_RE.search(line))
+            has_card  = bool(_CARD_RE.search(line))
+            if has_phone or has_card or has_kamt or (has_bank and has_num):
+                signal += 1
+        if signal >= 2:
+            return True
     return False
 
 def _split_by_anchors(text):
@@ -509,14 +537,15 @@ async def handle_multi_order(msg, ctx, chunks):
     if skipped:
         lines.append(f"  ⚠️ Не распознано: {skipped}")
     await msg.reply_text("\n".join(lines))
+    await _send_list_to_chat(ctx, chat_id)
 
 # ─── end multi-order ──────────────────────────────────────────────
 
 
-_GUARD_CARD_RE  = re.compile(r'\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}')
+_GUARD_CARD_RE  = re.compile(r'(?<!\d)\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}(?!\d)')
 _GUARD_PHONE_RE = re.compile(r'\+?\s*[78][\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2}|(?<!\d)[789]\d{9,10}(?!\d)')
 
-_GUARD_CARD_RE  = re.compile(r'\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}')
+_GUARD_CARD_RE  = re.compile(r'(?<!\d)\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}(?!\d)')
 _GUARD_PHONE_RE = re.compile(r'\+?\s*[78][\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2}|(?<!\d)[789]\d{9,10}(?!\d)')
 
 def _amount_looks_real(text, amount):
@@ -603,13 +632,12 @@ async def handle_message(update, ctx):
             elif cur == "RUB" and r:
                 usd_total += o["amount"] / r
         remaining = usd_total - paid
-        # Оплаченную часть (RUB) прибавляем к балансу. Остаток уже минус в балансе с момента закрытия.
-        paid_rub = paid * rate if rate else 0
-        if paid_rub > 0:
+        # Оплаченную часть (USDT) прибавляем к балансу. Остаток уже минус в балансе с момента закрытия.
+        if paid > 0:
             cur = balance.get(settle_chat)
             if cur is None:
                 cur = 0
-            balance[settle_chat] = cur + paid_rub
+            balance[settle_chat] = cur + paid
         debt[settle_chat] = 0
         # Архивируем
         if settle_chat not in sessions:
@@ -1039,6 +1067,7 @@ async def handle_message(update, ctx):
             )
         except Exception:
             pass
+    await _send_list_to_chat(ctx, chat_id)
 
 async def handle_delete(update, ctx):
     msg = update.message
@@ -1082,6 +1111,10 @@ async def show_list(update, ctx):
         last_closed = next((o for o in reversed(get_orders(chat_id)) if o["status"] == "closed"), None)
         if last_closed:
             keyboard.append([InlineKeyboardButton(f"↩️ Отменить закрытие #{last_closed['id']}", callback_data=f"undo:{last_closed['id']}")])
+        _bulk = last_bulk_close.get(chat_id) or []
+        _still = [oid for oid in _bulk if any(o["id"]==oid and o["status"]=="closed" for o in get_orders(chat_id))]
+        if len(_still) >= 2:
+            keyboard.append([InlineKeyboardButton(f"↩️ Отменить закрытие всех ({len(_still)})", callback_data="undo_all")])
         keyboard.append([InlineKeyboardButton("💰 Пополнить баланс", callback_data="balance_topup")])
         if open_orders:
             keyboard.append([InlineKeyboardButton(f"✅ Закрыть все ({len(open_orders)})", callback_data="close_all")])
@@ -1115,19 +1148,12 @@ async def _do_close(msg_or_query, ctx, chat_id, order_id, user, close_rate, show
     order["closed_at"] = datetime.now().strftime("%H:%M")
     order["close_rate"] = close_rate
     try:
-        amt = order.get("amount") or 0
-        cur_currency = order.get("currency", "RUB")
-        close_r = order.get("close_rate")
-        main_r = get_rate(chat_id)
-        deduct = amt
-        if amt and cur_currency == "RUB" and close_r and main_r and close_r != main_r:
-            # сумма по курсу закрытия → USD → обратно в RUB по основному курсу
-            deduct = (amt / close_r) * main_r
-        if deduct:
+        deduct_usd = _order_to_usd(order, get_rate(chat_id))
+        if deduct_usd:
             cur_bal = balance.get(chat_id)
             if cur_bal is None:
                 cur_bal = 0
-            balance[chat_id] = cur_bal - deduct
+            balance[chat_id] = cur_bal - deduct_usd
     except Exception:
         pass
     try:
@@ -1162,6 +1188,10 @@ async def _show_list_inline(query, ctx, chat_id):
     last_closed = next((o for o in reversed(get_orders(chat_id)) if o["status"] == "closed"), None)
     if last_closed:
         keyboard.append([InlineKeyboardButton(f"Отменить закрытие #{last_closed['id']}", callback_data=f"undo:{last_closed['id']}")])
+    _bulk = last_bulk_close.get(chat_id) or []
+    _still = [oid for oid in _bulk if any(o["id"]==oid and o["status"]=="closed" for o in get_orders(chat_id))]
+    if len(_still) >= 2:
+        keyboard.append([InlineKeyboardButton(f"↩️ Отменить закрытие всех ({len(_still)})", callback_data="undo_all")])
     keyboard.append([InlineKeyboardButton("💰 Пополнить баланс", callback_data="balance_topup")])
     if open_orders:
         keyboard.append([InlineKeyboardButton(f"✅ Закрыть все ({len(open_orders)})", callback_data="close_all")])
@@ -1189,6 +1219,113 @@ async def _try_delete_source_message(ctx, chat_id, message_id, all_orders):
         return True
     except Exception:
         return False
+
+def build_excel_report(chat_id):
+    """Генерирует Excel-отчёт со всеми данными по chat_id. Возвращает BytesIO."""
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    rate = get_rate(chat_id)
+    orders_list = [o for o in get_orders(chat_id) if o["status"] in ("closed", "settled")]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Отчёт"
+    bold = Font(bold=True)
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    center = Alignment(horizontal="center")
+    thin = Side(border_style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    headers = ["#", "Время", "Банк", "Сумма", "Валюта", "Курс", "USD", "Карта", "Телефон", "Статус"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = border
+    usd_total = 0
+    rub_total = 0
+    for o in orders_list:
+        amt = o.get("amount") or 0
+        cur = o.get("currency", "RUB")
+        r = o.get("close_rate") or o.get("rate") or rate
+        if cur in ("USDT", "USD", "USDC"):
+            order_usd = amt
+        elif cur == "RUB" and r:
+            order_usd = amt / r
+            rub_total += amt
+        else:
+            order_usd = 0
+            if cur == "RUB":
+                rub_total += amt
+        usd_total += order_usd
+        ws.append([
+            o.get("id"),
+            o.get("closed_at") or o.get("added_at") or "",
+            o.get("bank") or "?",
+            amt,
+            cur,
+            r or "",
+            round(order_usd, 3) if order_usd else "",
+            str(o.get("card") or ""),
+            str(o.get("phone") or ""),
+            o.get("status"),
+        ])
+        for cell in ws[ws.max_row]:
+            cell.border = border
+    ws.append([])
+    ws.append(["", "", "Итого RUB:", rub_total, "", "", "", "", "", ""])
+    ws[ws.max_row][2].font = bold
+    ws[ws.max_row][3].font = bold
+    ws.append(["", "", "Итого USD:", "", "", "", round(usd_total, 3), "", "", ""])
+    ws[ws.max_row][2].font = bold
+    ws[ws.max_row][6].font = bold
+    ws.append([])
+    # Пополнения
+    tps = topups.get(chat_id) or []
+    if tps:
+        ws.append(["💰 Пополнения баланса:"])
+        ws[ws.max_row][0].font = bold
+        ws.append(["Время", "RUB", "USD", "Курс"])
+        for cell in ws[ws.max_row]:
+            cell.font = bold
+        topup_rub_sum = 0
+        topup_usd_sum = 0
+        for t in tps:
+            a_rub = t.get("amount") or 0
+            a_usd = t.get("amount_usd") or 0
+            tr = t.get("rate") or ""
+            topup_rub_sum += a_rub
+            topup_usd_sum += a_usd
+            ws.append([t.get("date", ""), a_rub, round(a_usd, 3) if a_usd else "", tr])
+        ws.append(["Итого:", topup_rub_sum, round(topup_usd_sum, 3) if topup_usd_sum else "", ""])
+        ws[ws.max_row][0].font = bold
+        ws[ws.max_row][1].font = bold
+        ws[ws.max_row][2].font = bold
+        ws.append([])
+    # Итоговый баланс
+    bal_usd = balance.get(chat_id)
+    ws.append(["💼 Текущий баланс:"])
+    ws[ws.max_row][0].font = bold
+    if bal_usd is None:
+        ws.append(["Не задан"])
+    else:
+        bal_rub = bal_usd * rate if rate else None
+        ws.append(["В USD:", round(bal_usd, 3)])
+        ws[ws.max_row][0].font = bold
+        if bal_rub is not None:
+            ws.append(["В RUB:", int(bal_rub)])
+            ws[ws.max_row][0].font = bold
+        if rate:
+            ws.append(["По курсу:", rate])
+            ws[ws.max_row][0].font = bold
+    widths = [6, 10, 14, 14, 10, 8, 14, 20, 18, 10]
+    for col_idx, w in enumerate(widths, 1):
+        ws.column_dimensions[chr(64 + col_idx)].width = w
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
 
 async def handle_callback(update, ctx):
     query = update.callback_query
@@ -1301,26 +1438,69 @@ async def handle_callback(update, ctx):
             ])
         )
 
+    elif data == "report_excel":
+        try:
+            from telegram import InputFile
+            ord_list = [o for o in get_orders(chat_id) if o["status"] in ("closed", "settled")]
+            if not ord_list and not topups.get(chat_id) and balance.get(chat_id) is None:
+                await query.answer("Нет данных для отчёта", show_alert=True)
+                return
+            bio = build_excel_report(chat_id)
+            fname = f"report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            await ctx.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(bio, filename=fname),
+                caption="📊 Отчёт за день"
+            )
+        except Exception as e:
+            logger.error(f"Excel error: {e}")
+            try:
+                await ctx.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка генерации Excel: {e}")
+            except Exception:
+                pass
+
+    elif data == "undo_all":
+        bulk = last_bulk_close.get(chat_id) or []
+        restored = 0
+        for oid in bulk:
+            order = next((o for o in get_orders(chat_id) if o["id"] == oid), None)
+            if not order or order["status"] != "closed":
+                continue
+            try:
+                add_back_usd = _order_to_usd(order, get_rate(chat_id))
+                if add_back_usd:
+                    cur_bal = balance.get(chat_id)
+                    if cur_bal is None:
+                        cur_bal = 0
+                    balance[chat_id] = cur_bal + add_back_usd
+            except Exception:
+                pass
+            order["status"] = "open"
+            order["closed_by"] = None
+            order["closed_at"] = None
+            order["close_rate"] = None
+            try:
+                await ctx.bot.set_message_reaction(chat_id=chat_id, message_id=order["message_id"], reaction=[ReactionTypeEmoji(emoji="👍")])
+            except Exception:
+                pass
+            restored += 1
+        last_bulk_close.pop(chat_id, None)
+        await query.answer(f"Восстановлено заявок: {restored}", show_alert=False)
+        await _show_list_inline(query, ctx, chat_id)
+
     elif data.startswith("undo:"):
         order_id = int(data.split(":")[1])
         order = next((o for o in get_orders(chat_id) if o["id"] == order_id), None)
         if not order or order["status"] != "closed":
             await query.edit_message_text("⚠️ Нельзя отменить.")
             return
-        # Возвращаем баланс (та же формула что и при списании в _do_close)
         try:
-            amt = order.get("amount") or 0
-            cur_currency = order.get("currency", "RUB")
-            close_r = order.get("close_rate")
-            main_r = get_rate(chat_id)
-            add_back = amt
-            if amt and cur_currency == "RUB" and close_r and main_r and close_r != main_r:
-                add_back = (amt / close_r) * main_r
-            if add_back:
+            add_back_usd = _order_to_usd(order, get_rate(chat_id))
+            if add_back_usd:
                 cur_bal = balance.get(chat_id)
                 if cur_bal is None:
                     cur_bal = 0
-                balance[chat_id] = cur_bal + add_back
+                balance[chat_id] = cur_bal + add_back_usd
         except Exception:
             pass
         order["status"] = "open"
@@ -1357,15 +1537,16 @@ async def handle_callback(update, ctx):
         bal_text = ""
         cur_bal = balance.get(chat_id)
         if cur_bal is not None:
-            bal_str = f"{int(cur_bal):,}".replace(",", " ") + " ₽"
             if rate:
-                bal_str += f" / {fmt_usd(cur_bal / rate)}"
+                bal_str = f"{int(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
+            else:
+                bal_str = fmt_usd(cur_bal)
             bal_text = f"\n\n💰 Баланс: {bal_str}"
             if cur_bal < 0:
-                need = -cur_bal
-                need_str = f"{int(need):,}".replace(",", " ") + " ₽"
+                need_usd = -cur_bal
+                need_str = fmt_usd(need_usd)
                 if rate:
-                    need_str += f" / {fmt_usd(need / rate)}"
+                    need_str = f"{int(need_usd * rate):,}".replace(",", " ") + " ₽ / " + need_str
                 bal_text += f"\n📉 Не хватает: {need_str}"
             elif cur_bal > 0:
                 bal_text += f"\n✅ Остаток в плюсе"
@@ -1385,8 +1566,10 @@ async def handle_callback(update, ctx):
         bal_lbl = "💰 Пополнить баланс"
         cur_bal_v = balance.get(chat_id)
         if cur_bal_v is not None:
-            bal_rub_str = f"{int(cur_bal_v):,}".replace(",", " ") + " ₽"
-            bal_lbl += f" (сейчас {bal_rub_str})"
+            if rate:
+                bal_lbl += f" (сейчас {int(cur_bal_v * rate):,} ₽)".replace(",", " ")
+            else:
+                bal_lbl += f" (сейчас {fmt_usd(cur_bal_v)})"
         keyboard_calc = [
             [InlineKeyboardButton(full_lbl, callback_data="settle_confirm"),
              InlineKeyboardButton("💸 Частично", callback_data="settle_partial")],
@@ -1454,11 +1637,11 @@ async def handle_callback(update, ctx):
                 usd_paid_total += amt
                 if r:
                     sum_rub += amt * r
-        if sum_rub > 0:
+        if usd_paid_total > 0:
             cur_bal = balance.get(chat_id)
             if cur_bal is None:
                 cur_bal = 0
-            balance[chat_id] = cur_bal + sum_rub
+            balance[chat_id] = cur_bal + usd_paid_total
         # Архивируем сессию
         if chat_id not in sessions:
             sessions[chat_id] = []
@@ -1526,12 +1709,12 @@ async def handle_callback(update, ctx):
             order["closed_at"] = datetime.now().strftime("%H:%M")
             order["close_rate"] = None
             try:
-                amt = order.get("amount") or 0
-                if amt:
+                deduct_usd = _order_to_usd(order, get_rate(chat_id))
+                if deduct_usd:
                     cur_bal = balance.get(chat_id)
                     if cur_bal is None:
                         cur_bal = 0
-                    balance[chat_id] = cur_bal - amt
+                    balance[chat_id] = cur_bal - deduct_usd
             except Exception:
                 pass
             try:
@@ -1539,6 +1722,7 @@ async def handle_callback(update, ctx):
             except Exception:
                 pass
             closed_n += 1
+        last_bulk_close[chat_id] = [o["id"] for o in open_orders]
         await query.answer(f"Закрыто заявок: {closed_n}", show_alert=False)
         await _show_list_inline(query, ctx, chat_id)
 
@@ -1605,9 +1789,10 @@ async def handle_callback(update, ctx):
     elif data == "balance_topup_settle":
         cur_bal = balance.get(chat_id) or 0
         rate = get_rate(chat_id)
-        bal_str = f"{int(cur_bal):,}".replace(",", " ") + " ₽"
         if rate:
-            bal_str += f" / {fmt_usd(cur_bal / rate)}"
+            bal_str = f"{int(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
+        else:
+            bal_str = fmt_usd(cur_bal)
         hint = ""
         keyboard_b = [
             [InlineKeyboardButton("100к", callback_data="balance_confirm_settle:100000"),
@@ -1626,15 +1811,21 @@ async def handle_callback(update, ctx):
     elif data.startswith("balance_add_settle:"):
         try:
             amt = int(data.split(":")[1])
-            cur = balance.get(chat_id) or 0
-            balance[chat_id] = cur + amt
-            topups.setdefault(chat_id, []).append({"date": datetime.now().strftime("%H:%M"), "amount": amt})
-            new_bal = balance[chat_id]
             rate = get_rate(chat_id)
-            bal_str = f"{int(new_bal):,}".replace(",", " ") + " ₽"
+            if not rate:
+                await query.edit_message_text("⚠️ Сначала установи курс через /setrate, потом пополняй.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← В список", callback_data="go_list")]]))
+                return
+            amt_usd = amt / rate
+            cur = balance.get(chat_id) or 0
+            balance[chat_id] = cur + amt_usd
+            topups.setdefault(chat_id, []).append({"date": datetime.now().strftime("%H:%M"), "amount": amt, "amount_usd": amt_usd, "rate": rate})
+            new_bal = balance[chat_id]
             if rate:
-                bal_str += f" / {fmt_usd(new_bal / rate)}"
-            amt_str = f"{amt:,}".replace(",", " ") + " ₽"
+                bal_str = f"{int(new_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(new_bal)
+            else:
+                bal_str = fmt_usd(new_bal)
+            amt_str = f"{amt:,}".replace(",", " ") + " ₽ (≈ " + fmt_usd(amt_usd) + ")"
             keyboard_b = [
                 [InlineKeyboardButton("➕ Ещё пополнить", callback_data="balance_topup_settle")],
                 [InlineKeyboardButton("← В список", callback_data="go_list")],
@@ -1649,9 +1840,10 @@ async def handle_callback(update, ctx):
     elif data == "balance_topup":
         cur_bal = balance.get(chat_id) or 0
         rate = get_rate(chat_id)
-        bal_str = f"{int(cur_bal):,}".replace(",", " ") + " ₽"
         if rate:
-            bal_str += f" / {fmt_usd(cur_bal / rate)}"
+            bal_str = f"{int(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
+        else:
+            bal_str = fmt_usd(cur_bal)
         keyboard_b = [
             [InlineKeyboardButton("100к", callback_data="balance_confirm:100000"),
              InlineKeyboardButton("150к", callback_data="balance_confirm:150000")],
@@ -1669,15 +1861,21 @@ async def handle_callback(update, ctx):
     elif data.startswith("balance_add:"):
         try:
             amt = int(data.split(":")[1])
-            cur = balance.get(chat_id) or 0
-            balance[chat_id] = cur + amt
-            topups.setdefault(chat_id, []).append({"date": datetime.now().strftime("%H:%M"), "amount": amt})
-            new_bal = balance[chat_id]
             rate = get_rate(chat_id)
-            bal_str = f"{int(new_bal):,}".replace(",", " ") + " ₽"
+            if not rate:
+                await query.edit_message_text("⚠️ Сначала установи курс через /setrate, потом пополняй.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← В список", callback_data="go_list")]]))
+                return
+            amt_usd = amt / rate
+            cur = balance.get(chat_id) or 0
+            balance[chat_id] = cur + amt_usd
+            topups.setdefault(chat_id, []).append({"date": datetime.now().strftime("%H:%M"), "amount": amt, "amount_usd": amt_usd, "rate": rate})
+            new_bal = balance[chat_id]
             if rate:
-                bal_str += f" / {fmt_usd(new_bal / rate)}"
-            amt_str = f"{amt:,}".replace(",", " ") + " ₽"
+                bal_str = f"{int(new_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(new_bal)
+            else:
+                bal_str = fmt_usd(new_bal)
+            amt_str = f"{amt:,}".replace(",", " ") + " ₽ (≈ " + fmt_usd(amt_usd) + ")"
             keyboard_b = [
                 [InlineKeyboardButton("➕ Ещё пополнить", callback_data="balance_topup")],
                 [InlineKeyboardButton("← В список", callback_data="go_list")],
@@ -2080,6 +2278,58 @@ async def cmd_refresh(update, ctx):
     order["label"] = format_label(order)
     await msg.reply_text(f"✅ Заявка #{order['id']} обновлена:\n{order['label']}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← В меню", callback_data="go_list")]]))
 
+async def _send_list_to_chat(ctx, chat_id):
+    """Отправляет в чат свежее меню /list, удаляя предыдущее. Используется автообновлением."""
+    try:
+        open_orders = [o for o in get_orders(chat_id) if o["status"] == "open"]
+        closed_orders = [o for o in get_orders(chat_id) if o["status"] == "closed"]
+        settled_orders = [o for o in get_orders(chat_id) if o["status"] == "settled"]
+        rate_text = f"💱 Курс: {current_rate[chat_id]} ₽\n" if chat_id in current_rate else ""
+        has_debt = debt.get(chat_id, 0) > 0
+        has_sessions = bool(sessions.get(chat_id))
+        if not open_orders and not closed_orders and not settled_orders and not has_debt and not has_sessions:
+            text = f"{rate_text}{_balance_line(chat_id)}📭 Активных заявок нет. Отправляй заявки в чат."
+            keyboard = [[InlineKeyboardButton("💰 Пополнить баланс", callback_data="balance_topup")]]
+        else:
+            keyboard = [[InlineKeyboardButton(f"#{o['id']}  {o['label']}  ({o['added_at']})", callback_data=f"ask:{o['id']}")] for o in open_orders]
+            btn_row = []
+            if closed_orders or settled_orders:
+                btn_row.append(InlineKeyboardButton("💰 Результат дня", callback_data="show_total"))
+            if closed_orders or (balance.get(chat_id) is not None and balance[chat_id] < 0):
+                btn_row.append(InlineKeyboardButton("🧾 Посчитаться", callback_data="calculate"))
+            if btn_row:
+                keyboard.append(btn_row)
+            if sessions.get(chat_id):
+                keyboard.append([InlineKeyboardButton("📒 Логи сессий", callback_data="show_logs")])
+            last_closed = next((o for o in reversed(get_orders(chat_id)) if o["status"] == "closed"), None)
+            if last_closed:
+                keyboard.append([InlineKeyboardButton(f"↩️ Отменить закрытие #{last_closed['id']}", callback_data=f"undo:{last_closed['id']}")])
+            _bulk = last_bulk_close.get(chat_id) or []
+            _still = [oid for oid in _bulk if any(o["id"]==oid and o["status"]=="closed" for o in get_orders(chat_id))]
+            if len(_still) >= 2:
+                keyboard.append([InlineKeyboardButton(f"↩️ Отменить закрытие всех ({len(_still)})", callback_data="undo_all")])
+            keyboard.append([InlineKeyboardButton("💰 Пополнить баланс", callback_data="balance_topup")])
+            if open_orders:
+                keyboard.append([InlineKeyboardButton(f"✅ Закрыть все ({len(open_orders)})", callback_data="close_all")])
+                keyboard.append([InlineKeyboardButton("🗑 Удалить заявку", callback_data="del_menu")])
+            text = rate_text + _balance_line(chat_id) + (f"📋 Активные заявки — {len(open_orders)} шт.\nНажми чтобы закрыть:" if open_orders else "📭 Активных заявок нет.")
+        markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        prev_id = last_list_msg.get(chat_id)
+        if prev_id:
+            try:
+                await ctx.bot.delete_message(chat_id=chat_id, message_id=prev_id)
+            except Exception:
+                pass
+            try:
+                if chat_id in bot_msgs and prev_id in bot_msgs[chat_id]:
+                    bot_msgs[chat_id].remove(prev_id)
+            except Exception:
+                pass
+        sent = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        last_list_msg[chat_id] = sent.message_id
+    except Exception as e:
+        logger.warning(f"_send_list_to_chat: {e}")
+
 async def handle_reaction(update, ctx):
     """Если пользователь поставил 👍 на любое сообщение — открыть /list."""
     react = update.message_reaction
@@ -2098,53 +2348,7 @@ async def handle_reaction(update, ctx):
     new_e = _emojis(react.new_reaction)
     old_e = _emojis(react.old_reaction)
     if "👍" in new_e and "👍" not in old_e:
-        chat_id = react.chat.id
-        # Сборка меню /list (как в show_list, но без удаления команды)
-        try:
-            open_orders = [o for o in get_orders(chat_id) if o["status"] == "open"]
-            closed_orders = [o for o in get_orders(chat_id) if o["status"] == "closed"]
-            settled_orders = [o for o in get_orders(chat_id) if o["status"] == "settled"]
-            rate_text = f"💱 Курс: {current_rate[chat_id]} ₽\n" if chat_id in current_rate else ""
-            has_debt = debt.get(chat_id, 0) > 0
-            has_sessions = bool(sessions.get(chat_id))
-            if not open_orders and not closed_orders and not settled_orders and not has_debt and not has_sessions:
-                text = f"{rate_text}{_balance_line(chat_id)}📭 Активных заявок нет. Отправляй заявки в чат."
-                keyboard = [[InlineKeyboardButton("💰 Пополнить баланс", callback_data="balance_topup")]]
-            else:
-                keyboard = [[InlineKeyboardButton(f"#{o['id']}  {o['label']}  ({o['added_at']})", callback_data=f"ask:{o['id']}")] for o in open_orders]
-                btn_row = []
-                if closed_orders or settled_orders:
-                    btn_row.append(InlineKeyboardButton("💰 Результат дня", callback_data="show_total"))
-                if closed_orders or (balance.get(chat_id) is not None and balance[chat_id] < 0):
-                    btn_row.append(InlineKeyboardButton("🧾 Посчитаться", callback_data="calculate"))
-                if btn_row:
-                    keyboard.append(btn_row)
-                if sessions.get(chat_id):
-                    keyboard.append([InlineKeyboardButton("📒 Логи сессий", callback_data="show_logs")])
-                last_closed = next((o for o in reversed(get_orders(chat_id)) if o["status"] == "closed"), None)
-                if last_closed:
-                    keyboard.append([InlineKeyboardButton(f"↩️ Отменить закрытие #{last_closed['id']}", callback_data=f"undo:{last_closed['id']}")])
-                keyboard.append([InlineKeyboardButton("💰 Пополнить баланс", callback_data="balance_topup")])
-                if open_orders:
-                    keyboard.append([InlineKeyboardButton(f"✅ Закрыть все ({len(open_orders)})", callback_data="close_all")])
-                    keyboard.append([InlineKeyboardButton("🗑 Удалить заявку", callback_data="del_menu")])
-                text = rate_text + _balance_line(chat_id) + (f"📋 Активные заявки — {len(open_orders)} шт.\nНажми чтобы закрыть:" if open_orders else "📭 Активных заявок нет.")
-            markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-            prev_id = last_list_msg.get(chat_id)
-            if prev_id:
-                try:
-                    await ctx.bot.delete_message(chat_id=chat_id, message_id=prev_id)
-                except Exception:
-                    pass
-                try:
-                    if chat_id in bot_msgs and prev_id in bot_msgs[chat_id]:
-                        bot_msgs[chat_id].remove(prev_id)
-                except Exception:
-                    pass
-            sent = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
-            last_list_msg[chat_id] = sent.message_id
-        except Exception as e:
-            logger.warning(f"handle_reaction: {e}")
+        await _send_list_to_chat(ctx, react.chat.id)
 
 async def cmd_logs(update, ctx):
     """Показать историю всех сессий"""
