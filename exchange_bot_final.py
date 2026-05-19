@@ -277,13 +277,20 @@ _PHONE_RE = re.compile(r'\+\s*7[\s\-\(\)]*(\d[\s\-\(\)]*){10}|(?<!\d)8[\s\-\(\)]
 _CARD_RE  = re.compile(r'(?<!\d)\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}(?!\d)')
 
 def normalize_amount_spaces(text):
-    """Склеивает числа с пробелами как разделители тысяч: '5 600' → '5600'.
-    Не трогает 4-значные группы (карты) и одиночные цифры."""
-    return re.sub(
+    """Склеивает числа с разделителями тысяч:
+       '5 600' → '5600' (пробел), '20.000' → '20000' (точка перед 3 цифрами).
+       Не трогает 4-значные группы (карты), доли (1.5к), одиночные цифры."""
+    text = re.sub(
         r'\b(\d{1,3}(?:\s+\d{3})+)\b',
         lambda m: re.sub(r'\s+', '', m.group(0)),
         text
     )
+    # Точка как разделитель тысяч: 20.000 → 20000, 1.234.567 → 1234567
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r'(?<!\d)(\d{1,3})\.(\d{3})(?!\d)', r'\1\2', text)
+    return text
 
 def _find_bank(text):
     t = text.lower()
@@ -355,6 +362,7 @@ def parse_chunk_local(chunk):
 
 def is_multi_order(text):
     """True если сообщение содержит несколько заявок"""
+    text = normalize_amount_spaces(text)
     phones  = _PHONE_RE.findall(text)
     cards   = _CARD_RE.findall(text)
     amounts = _AMT_RE.findall(text) + _K_RE.findall(text)
@@ -420,6 +428,7 @@ def split_order_chunks(text):
     Правило: новая заявка начинается когда текущий чанк уже ПОЛНЫЙ
     (имеет и сумму/банк, и реквизиты), либо когда новая строка дублирует
     то что уже есть в чанке."""
+    text = normalize_amount_spaces(text)  # 20.000 → 20000, 5 600 → 5600
     lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
     if len(lines) > 1:
         line_chunks = []
@@ -431,7 +440,7 @@ def split_order_chunks(text):
             has_tyr   = bool(_AMT_RE.search(line) or _K_RE.search(line))
             has_bank  = any(key in line_lower for key in BANK_MAP)
             has_num   = bool(re.search(r'\b\d{4,7}\b', line))
-            line_has_amt   = has_tyr or (has_bank and has_num)
+            line_has_amt   = has_tyr or has_num or (has_bank and has_num)
             line_has_phone = bool(_PHONE_RE.search(line))
             line_has_card  = bool(_CARD_RE.search(line)) and not line_has_phone
             line_has_req   = line_has_phone or line_has_card
@@ -642,6 +651,7 @@ async def handle_message(update, ctx):
         # Архивируем
         if settle_chat not in sessions:
             sessions[settle_chat] = []
+        paid_rub_val = paid * rate if rate else 0
         sessions[settle_chat].append({
             "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
             "count": len(closed_orders),
@@ -650,7 +660,7 @@ async def handle_message(update, ctx):
             "debt": 0,
             "topups": list(topups.get(settle_chat, [])),
             "final_balance": balance.get(settle_chat),
-            "settled_rub": paid_rub,
+            "settled_rub": paid_rub_val,
         })
         for o in get_orders(settle_chat):
             if o["status"] == "closed":
@@ -658,15 +668,19 @@ async def handle_message(update, ctx):
         bal_after = balance.get(settle_chat)
         bal_line = ""
         if bal_after is not None:
-            bal_str = f"{int(bal_after):,}".replace(",", " ") + " ₽"
             if rate:
-                bal_str += f" / {fmt_usd(bal_after / rate)}"
+                bal_str = f"{round(bal_after * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(bal_after)
+            else:
+                bal_str = fmt_usd(bal_after)
             bal_line = f"\n💰 Баланс: {bal_str}"
-        if paid_rub > 0:
-            paid_rub_str = f"{int(paid_rub):,}".replace(",", " ") + " ₽"
-            head = f"✅ Оплачено: {fmt_usd(paid)} (+{paid_rub_str} на баланс)"
+        if paid > 0:
+            if rate:
+                paid_rub_str = f"{int(paid_rub_val):,}".replace(",", " ") + " ₽"
+                head = f"✅ Оплачено: {fmt_usd(paid)} (+{paid_rub_str} на баланс)"
+            else:
+                head = f"✅ Оплачено: {fmt_usd(paid)} (+{fmt_usd(paid)} на баланс)"
         else:
-            head = f"✅ Оплачено: {fmt_usd(paid)}"
+            head = f"✅ Оплачено: 0 (баланс не изменился)"
         if remaining > 0:
             tail = f"\n📉 Остаток {fmt_usd(remaining)} остаётся минусом в балансе"
         else:
@@ -1538,7 +1552,7 @@ async def handle_callback(update, ctx):
         cur_bal = balance.get(chat_id)
         if cur_bal is not None:
             if rate:
-                bal_str = f"{int(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
+                bal_str = f"{round(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
             else:
                 bal_str = fmt_usd(cur_bal)
             bal_text = f"\n\n💰 Баланс: {bal_str}"
@@ -1546,7 +1560,7 @@ async def handle_callback(update, ctx):
                 need_usd = -cur_bal
                 need_str = fmt_usd(need_usd)
                 if rate:
-                    need_str = f"{int(need_usd * rate):,}".replace(",", " ") + " ₽ / " + need_str
+                    need_str = f"{round(need_usd * rate):,}".replace(",", " ") + " ₽ / " + need_str
                 bal_text += f"\n📉 Не хватает: {need_str}"
             elif cur_bal > 0:
                 bal_text += f"\n✅ Остаток в плюсе"
@@ -1556,26 +1570,35 @@ async def handle_callback(update, ctx):
             + usd_line
             + debt_text
             + bal_text
-            + "\n\n✅ В 0 — контрагент оплатил всё, сумма заявок зачислится на баланс."
+            + "\n\n📊 Зачислить за заявки — прибавить сумму всех закрытых заявок к балансу."
             "\n💸 Частично — ввести сумму оплаты, она зачислится на баланс."
+            "\n🔄 Обнулить баланс — довести текущий баланс до 0 (независимо от заявок)."
             "\n💰 Пополнить баланс — добавить РУБ в кассу вручную."
         )
-        full_lbl = "✅ В 0"
+        full_lbl = "📊 Зачислить за заявки"
         if usd_total > 0:
-            full_lbl += f" · {fmt_usd(usd_total)}"
+            full_lbl += f" +{fmt_usd(usd_total)}"
         bal_lbl = "💰 Пополнить баланс"
         cur_bal_v = balance.get(chat_id)
         if cur_bal_v is not None:
             if rate:
-                bal_lbl += f" (сейчас {int(cur_bal_v * rate):,} ₽)".replace(",", " ")
+                bal_lbl += f" (сейчас {round(cur_bal_v * rate):,} ₽)".replace(",", " ")
             else:
                 bal_lbl += f" (сейчас {fmt_usd(cur_bal_v)})"
-        keyboard_calc = [
+        # Кнопка «Обнулить баланс» — показываем только если баланс не нулевой
+        rows = [
             [InlineKeyboardButton(full_lbl, callback_data="settle_confirm"),
              InlineKeyboardButton("💸 Частично", callback_data="settle_partial")],
-            [InlineKeyboardButton(bal_lbl, callback_data="balance_topup_settle")],
-            [InlineKeyboardButton("← В список", callback_data="go_list")],
         ]
+        if cur_bal_v is not None and cur_bal_v < 0:
+            zero_lbl = "🔄 Обнулить баланс"
+            delta_usd = -cur_bal_v
+            sign = "+" if delta_usd > 0 else "−"
+            zero_lbl += f" ({sign}{fmt_usd(abs(delta_usd))})"
+            rows.append([InlineKeyboardButton(zero_lbl, callback_data="zero_confirm")])
+        rows.append([InlineKeyboardButton(bal_lbl, callback_data="balance_topup_settle")])
+        rows.append([InlineKeyboardButton("← В список", callback_data="go_list")])
+        keyboard_calc = rows
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard_calc))
 
     elif data == "settle_partial":
@@ -1584,6 +1607,67 @@ async def handle_callback(update, ctx):
         await query.edit_message_text(
             "Введи сколько оплачено в USD:",
             reply_markup=InlineKeyboardMarkup(keyboard_p)
+        )
+
+    elif data == "zero_confirm":
+        cur_bal = balance.get(chat_id)
+        if cur_bal is None or abs(cur_bal) < 0.0001:
+            await query.answer("Баланс уже 0", show_alert=True)
+            return
+        rate = get_rate(chat_id)
+        bal_str = fmt_usd(cur_bal)
+        if rate:
+            bal_str = f"{round(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
+        delta_usd = -cur_bal
+        sign = "+" if delta_usd > 0 else "−"
+        delta_str = f"{sign}{fmt_usd(abs(delta_usd))}"
+        closed_orders = [o for o in get_orders(chat_id) if o["status"] == "closed"]
+        arch_note = f"\n📁 Архивируется {len(closed_orders)} закрытых заявок" if closed_orders else ""
+        await query.edit_message_text(
+            f"🔄 Обнулить баланс?\n\nТекущий баланс: {bal_str}\nКорректировка: {delta_str}{arch_note}\n\nПодтверди:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Точно обнулить", callback_data="zero")],
+                [InlineKeyboardButton("← Отмена", callback_data="calculate")],
+            ])
+        )
+
+    elif data == "zero":
+        cur_bal = balance.get(chat_id)
+        if cur_bal is None or abs(cur_bal) < 0.0001:
+            await query.answer("Баланс уже 0", show_alert=True)
+            return
+        closed_orders = [o for o in get_orders(chat_id) if o["status"] == "closed"]
+        rate = get_rate(chat_id)
+        delta_usd = -cur_bal  # корректировка чтобы стал 0
+        # Архивируем сессию (даже если closed_orders пуст — фиксируем операцию обнуления)
+        if chat_id not in sessions:
+            sessions[chat_id] = []
+        sessions[chat_id].append({
+            "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
+            "count": len(closed_orders),
+            "orders": [dict(o) for o in closed_orders],
+            "paid": cur_bal if cur_bal > 0 else None,
+            "debt": -cur_bal if cur_bal < 0 else 0,
+            "topups": list(topups.get(chat_id, [])),
+            "final_balance": 0.0,
+            "zeroed_from": cur_bal,
+        })
+        for o in get_orders(chat_id):
+            if o["status"] == "closed":
+                o["status"] = "settled"
+        balance[chat_id] = 0.0
+        debt[chat_id] = 0
+        topups.pop(chat_id, None)
+        last_bulk_close.pop(chat_id, None)
+        sign = "+" if delta_usd > 0 else "−"
+        op_str = f"{sign}{fmt_usd(abs(delta_usd))}"
+        msg_lines = [f"🔄 Баланс обнулён. Корректировка: {op_str}"]
+        if closed_orders:
+            msg_lines.append(f"📁 Архивировано заявок: {len(closed_orders)}")
+        msg_lines.append("💰 Баланс: 0 USD")
+        await query.edit_message_text(
+            "\n".join(msg_lines),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← В меню", callback_data="go_list")]])
         )
 
     elif data == "settle_confirm":
@@ -1790,7 +1874,7 @@ async def handle_callback(update, ctx):
         cur_bal = balance.get(chat_id) or 0
         rate = get_rate(chat_id)
         if rate:
-            bal_str = f"{int(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
+            bal_str = f"{round(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
         else:
             bal_str = fmt_usd(cur_bal)
         hint = ""
@@ -1822,7 +1906,7 @@ async def handle_callback(update, ctx):
             topups.setdefault(chat_id, []).append({"date": datetime.now().strftime("%H:%M"), "amount": amt, "amount_usd": amt_usd, "rate": rate})
             new_bal = balance[chat_id]
             if rate:
-                bal_str = f"{int(new_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(new_bal)
+                bal_str = f"{round(new_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(new_bal)
             else:
                 bal_str = fmt_usd(new_bal)
             amt_str = f"{amt:,}".replace(",", " ") + " ₽ (≈ " + fmt_usd(amt_usd) + ")"
@@ -1841,7 +1925,7 @@ async def handle_callback(update, ctx):
         cur_bal = balance.get(chat_id) or 0
         rate = get_rate(chat_id)
         if rate:
-            bal_str = f"{int(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
+            bal_str = f"{round(cur_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(cur_bal)
         else:
             bal_str = fmt_usd(cur_bal)
         keyboard_b = [
@@ -1872,7 +1956,7 @@ async def handle_callback(update, ctx):
             topups.setdefault(chat_id, []).append({"date": datetime.now().strftime("%H:%M"), "amount": amt, "amount_usd": amt_usd, "rate": rate})
             new_bal = balance[chat_id]
             if rate:
-                bal_str = f"{int(new_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(new_bal)
+                bal_str = f"{round(new_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(new_bal)
             else:
                 bal_str = fmt_usd(new_bal)
             amt_str = f"{amt:,}".replace(",", " ") + " ₽ (≈ " + fmt_usd(amt_usd) + ")"
