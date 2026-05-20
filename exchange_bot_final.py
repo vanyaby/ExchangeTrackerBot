@@ -691,6 +691,50 @@ async def handle_message(update, ctx):
         )
         return
 
+    # === Ввод произвольной суммы пополнения баланса в USDT ===
+    bal_input_usdt_chat = ctx.user_data.get("balance_input_usdt_chat")
+    bal_input_usdt_settle = ctx.user_data.get("balance_input_usdt_settle_chat")
+    if bal_input_usdt_chat or bal_input_usdt_settle:
+        target_chat = bal_input_usdt_chat or bal_input_usdt_settle
+        is_settle = bool(bal_input_usdt_settle)
+        s = (msg.text or "").strip().lower().replace(" ", "").replace(",", ".")
+        try:
+            amt_usd = float(s)
+        except ValueError:
+            await msg.reply_text("⚠️ Не понял сумму. Примеры: 150, 1500.5")
+            return
+        if amt_usd <= 0:
+            await msg.reply_text("⚠️ Сумма должна быть больше нуля.")
+            return
+        ctx.user_data.pop("balance_input_usdt_chat", None)
+        ctx.user_data.pop("balance_input_usdt_settle_chat", None)
+        rate = get_rate(target_chat)
+        cur = balance.get(target_chat)
+        if cur is None:
+            cur = 0
+        balance[target_chat] = cur + amt_usd
+        topups.setdefault(target_chat, []).append({
+            "date": datetime.now().strftime("%H:%M"),
+            "amount": int(amt_usd * rate) if rate else 0,
+            "amount_usd": amt_usd,
+            "rate": rate or 0,
+        })
+        new_bal = balance[target_chat]
+        if rate:
+            bal_str = f"{round(new_bal * rate):,}".replace(",", " ") + " ₽ / " + fmt_usd(new_bal)
+        else:
+            bal_str = fmt_usd(new_bal)
+        back_cb = "balance_topup_settle" if is_settle else "balance_topup"
+        keyboard_b = [
+            [InlineKeyboardButton("➕ Ещё пополнить", callback_data=back_cb)],
+            [InlineKeyboardButton("← В список", callback_data="go_list")],
+        ]
+        await msg.reply_text(
+            f"✅ Баланс пополнен на {fmt_usd(amt_usd)}\n\n💰 Новый баланс: {bal_str}",
+            reply_markup=InlineKeyboardMarkup(keyboard_b)
+        )
+        return
+
     # === Ввод произвольной суммы пополнения баланса ===
     bal_input_chat = ctx.user_data.get("balance_input_chat")
     bal_input_settle = ctx.user_data.get("balance_input_settle_chat")
@@ -983,10 +1027,11 @@ async def handle_message(update, ctx):
     # Если Groq вернул кривой/отсутствующий phone — попробуем найти его сами в тексте
     _raw_text = msg.text or ""
     if not parsed.get("phone") or not _phone_looks_real(_raw_text, parsed.get("phone")):
-        m = re.search(r'(?<!\d)([78]\d{10}|9\d{9})(?!\d)', re.sub(r'[\s\-\(\)]', '', _raw_text))
+        m = _PHONE_RE.search(_raw_text)
         if m:
-            digits = m.group(1)
-            parsed["phone"] = "+7" + digits[-10:]
+            digits = re.sub(r'\D', '', m.group())
+            if 10 <= len(digits) <= 11:
+                parsed["phone"] = "+7" + digits[-10:]
 
     # Точечно отсекаем галлюцинации Groq — обнуляем поля, которых нет в тексте
     _check_text = _raw_text
@@ -1810,6 +1855,24 @@ async def handle_callback(update, ctx):
         await query.answer(f"Закрыто заявок: {closed_n}", show_alert=False)
         await _show_list_inline(query, ctx, chat_id)
 
+    elif data == "balance_custom_usdt":
+        ctx.user_data["balance_input_usdt_chat"] = chat_id
+        for k in ("balance_input_chat", "balance_input_settle_chat", "balance_input_usdt_settle_chat"):
+            ctx.user_data.pop(k, None)
+        await query.edit_message_text(
+            "💵 Введи сумму пополнения в USDT\n(например: 150, 1500.5)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Назад", callback_data="balance_topup")]])
+        )
+
+    elif data == "balance_custom_usdt_settle":
+        ctx.user_data["balance_input_usdt_settle_chat"] = chat_id
+        for k in ("balance_input_chat", "balance_input_settle_chat", "balance_input_usdt_chat"):
+            ctx.user_data.pop(k, None)
+        await query.edit_message_text(
+            "💵 Введи сумму пополнения в USDT\n(например: 150, 1500.5)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Назад", callback_data="balance_topup_settle")]])
+        )
+
     elif data == "balance_custom":
         ctx.user_data["balance_input_chat"] = chat_id
         ctx.user_data.pop("balance_input_settle_chat", None)
@@ -1884,7 +1947,8 @@ async def handle_callback(update, ctx):
             [InlineKeyboardButton("200к", callback_data="balance_confirm_settle:200000"),
              InlineKeyboardButton("250к", callback_data="balance_confirm_settle:250000")],
             [InlineKeyboardButton("300к", callback_data="balance_confirm_settle:300000")],
-            [InlineKeyboardButton("✏️ Своя сумма", callback_data="balance_custom_settle")],
+            [InlineKeyboardButton("✏️ Своя сумма (₽)", callback_data="balance_custom_settle")],
+            [InlineKeyboardButton("💵 Своя сумма (USDT)", callback_data="balance_custom_usdt_settle")],
             [InlineKeyboardButton("← Назад", callback_data="calculate")],
         ]
         await query.edit_message_text(
@@ -1934,7 +1998,8 @@ async def handle_callback(update, ctx):
             [InlineKeyboardButton("200к", callback_data="balance_confirm:200000"),
              InlineKeyboardButton("250к", callback_data="balance_confirm:250000")],
             [InlineKeyboardButton("300к", callback_data="balance_confirm:300000")],
-            [InlineKeyboardButton("✏️ Своя сумма", callback_data="balance_custom")],
+            [InlineKeyboardButton("✏️ Своя сумма (₽)", callback_data="balance_custom")],
+            [InlineKeyboardButton("💵 Своя сумма (USDT)", callback_data="balance_custom_usdt")],
             [InlineKeyboardButton("← В список", callback_data="go_list")],
         ]
         await query.edit_message_text(
