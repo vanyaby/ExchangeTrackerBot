@@ -2769,7 +2769,14 @@ def main():
             return msg
         _TGBot.send_message = _tracked_send_message
         _TGBot._send_patched = True
-    print("✅ Бот запущен...")
+    print("=" * 50)
+    print("✅ ExchangeTrackerBot запущен")
+    print("📅 Версия: 2026-05-25")
+    print("─" * 50)
+    print("🛑 /stop  → отчёт дня + Excel + чистка памяти")
+    print("💰 _balance_line: round(rub) (фикс копеечного расхождения)")
+    print("🔗 _split_glued: 'сбер5000+79...' → 'сбер 5000 +79...'")
+    print("=" * 50)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
