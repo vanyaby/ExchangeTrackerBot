@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
+PROXYAPI_KEY = os.environ.get("PROXYAPI_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 WAITING_RATE = 0
@@ -65,7 +65,7 @@ def _balance_line(chat_id):
     rate = get_rate(chat_id)
     if rate:
         rub = bal_usd * rate
-        rub_str = f"{int(rub):,}".replace(",", " ") + " ₽"
+        rub_str = f"{round(rub):,}".replace(",", " ") + " ₽"
         bal_str = f"{rub_str} / {fmt_usd(bal_usd)}"
     else:
         bal_str = fmt_usd(bal_usd)
@@ -134,34 +134,41 @@ SYSTEM_PROMPT = """Ты парсер платёжных заявок. Возвр
 
 async def parse_with_groq(text):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        prompt = re.sub(r" - ", " ", normalize_amount_spaces(text))
+        async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                "https://api.proxyapi.ru/google/v1beta/models/gemini-2.0-flash:generateContent",
+                headers={"Authorization": f"Bearer {PROXYAPI_KEY}", "Content-Type": "application/json"},
                 json={
-                    "model": "llama-3.3-70b-versatile",
-                    "temperature": 0,
-                    "max_tokens": 300,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": re.sub(r" - ", " ", normalize_amount_spaces(text))}
-                    ]
-                }
+                    "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "maxOutputTokens": 300,
+                        "responseMimeType": "application/json",
+                    },
+                },
             )
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-            logger.info(f"Groq raw: {repr(raw)}")
+            if resp.status_code != 200:
+                logger.error(f"Gemini HTTP {resp.status_code}: {resp.text[:500]}")
+                return None
+            data = resp.json()
+            try:
+                raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (KeyError, IndexError, TypeError) as e:
+                logger.error(f"Gemini bad response shape: {e}; body={str(data)[:500]}")
+                return None
+            logger.info(f"Gemini raw: {repr(raw)}")
             raw = re.sub(r"```json|```", "", raw).strip()
-            # Вырезаем только JSON объект если есть лишний текст
             match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
             if not match:
                 raise ValueError("No JSON found")
             parsed = json.loads(match.group())
-            logger.info(f"Groq: {parsed}")
+            logger.info(f"Gemini: {parsed}")
             if parsed.get("amount") or parsed.get("card") or parsed.get("phone"):
                 return parsed
     except Exception as e:
-        logger.error(f"Groq error: {e}")
+        logger.error(f"Gemini error: {e}")
     return None
 
 def parse_amount(val):
@@ -273,8 +280,16 @@ BANK_MAP = {
 
 _AMT_RE   = re.compile(r'(\d+[\.,]?\d*)\s*(?:т\.?\s*р\.?|тр\b|тыс)', re.IGNORECASE)
 _K_RE     = re.compile(r'(\d+[\.,]?\d*)\s*[кk]\b', re.IGNORECASE)
-_PHONE_RE = re.compile(r'\+\s*7[\s\-\(\)]*(\d[\s\-\(\)]*){10}|(?<!\d)8[\s\-\(\)]*(\d[\s\-\(\)]*){10}|(?<!\d)7\d{10}(?!\d)|(?<!\d)9\d{9}(?!\d)')
-_CARD_RE  = re.compile(r'(?<!\d)\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}(?!\d)')
+_PHONE_RE = re.compile(r'\+\s*7[\s\-\(\)]*(\d[\s\-\(\)]*){10}|(?<!\d)[78][\s\-\(\)]*(\d[\s\-\(\)]*){10}|(?<!\d)7\d{10}(?!\d)|(?<!\d)9\d{9}(?!\d)')
+_CARD_RE  = re.compile(r'(?<!\d)\d{4}[\s\-]{0,2}\d{4}[\s\-]{0,2}\d{4}[\s\-]{0,2}\d{4}(?!\d)')
+def _split_glued(s):
+    """Разделяет склеенные части: сбер5000+79... -> сбер 5000 +79..."""
+    if not s:
+        return s
+    s = re.sub(r'([а-яА-Яa-zA-Z])(\d)', r'\1 \2', s)
+    s = re.sub(r'(\d+[ктмКТМkmKM])(\d{4,})', r'\1 \2', s)
+    s = re.sub(r'(\d)(\+\d)', r'\1 \2', s)
+    return s
 
 def normalize_amount_spaces(text):
     """Склеивает числа с разделителями тысяч:
@@ -551,10 +566,10 @@ async def handle_multi_order(msg, ctx, chunks):
 # ─── end multi-order ──────────────────────────────────────────────
 
 
-_GUARD_CARD_RE  = re.compile(r'(?<!\d)\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}(?!\d)')
+_GUARD_CARD_RE  = re.compile(r'(?<!\d)\d{4}[\s\-]{0,2}\d{4}[\s\-]{0,2}\d{4}[\s\-]{0,2}\d{4}(?!\d)')
 _GUARD_PHONE_RE = re.compile(r'\+?\s*[78][\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2}|(?<!\d)[789]\d{9,10}(?!\d)')
 
-_GUARD_CARD_RE  = re.compile(r'(?<!\d)\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}[ \t\-]?\d{4}(?!\d)')
+_GUARD_CARD_RE  = re.compile(r'(?<!\d)\d{4}[\s\-]{0,2}\d{4}[\s\-]{0,2}\d{4}[\s\-]{0,2}\d{4}(?!\d)')
 _GUARD_PHONE_RE = re.compile(r'\+?\s*[78][\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2}|(?<!\d)[789]\d{9,10}(?!\d)')
 
 def _amount_looks_real(text, amount):
@@ -915,17 +930,18 @@ async def handle_message(update, ctx):
     if not bot_active.get(msg.chat_id, True):
         return
     # Сначала пытаемся разделить на чанки (по строкам/anchors)
-    if is_multi_order(msg.text):
-        chunks = split_order_chunks(msg.text)
+    _text = _split_glued(msg.text)
+    if is_multi_order(_text):
+        chunks = split_order_chunks(_text)
         if len(chunks) > 1:
             await handle_multi_order(msg, ctx, chunks)
             return
     # Если в сообщении одна строка/заявка — раскрываем "N раз по X" / "N по X"
-    _mult_count, _mult_base = expand_multiplier(msg.text)
+    _mult_count, _mult_base = expand_multiplier(_text)
     if _mult_count > 1:
         await handle_multi_order(msg, ctx, [_mult_base] * _mult_count)
         return
-    parsed = await parse_with_groq(msg.text)
+    parsed = await parse_with_groq(_text)
     if not parsed:
         return
 
@@ -1025,13 +1041,21 @@ async def handle_message(update, ctx):
             parsed["card"] = None
 
     # Если Groq вернул кривой/отсутствующий phone — попробуем найти его сами в тексте
-    _raw_text = msg.text or ""
+    _raw_text = _text or ""
     if not parsed.get("phone") or not _phone_looks_real(_raw_text, parsed.get("phone")):
         m = _PHONE_RE.search(_raw_text)
         if m:
             digits = re.sub(r'\D', '', m.group())
             if 10 <= len(digits) <= 11:
                 parsed["phone"] = "+7" + digits[-10:]
+    # Если AI вернул кривой/отсутствующий card — попробуем найти его сами в тексте
+    if not parsed.get("card") or not _card_looks_real(_raw_text, parsed.get("card")):
+        m = _CARD_RE.search(_raw_text)
+        if m:
+            digits = re.sub(r'\D', '', m.group())
+            if len(digits) == 16:
+                parsed["card"] = digits
+
 
     # Точечно отсекаем галлюцинации Groq — обнуляем поля, которых нет в тексте
     _check_text = _raw_text
@@ -2559,15 +2583,79 @@ async def cancel_conv(update, ctx):
 
 async def cmd_stop(update, ctx):
     chat_id = update.effective_chat.id
+    rate = get_rate(chat_id)
+    closed_orders = [o for o in get_orders(chat_id) if o["status"] in ("closed", "settled")]
+    rub_total = 0
+    usd_total = 0
+    for o in closed_orders:
+        amt = o.get("amount") or 0
+        cur = o.get("currency", "RUB")
+        r = o.get("close_rate") or o.get("rate") or rate
+        if cur in ("USDT", "USD", "USDC"):
+            usd_total += amt
+        elif cur == "RUB" and r:
+            usd_total += amt / r
+            rub_total += amt
+        elif cur == "RUB":
+            rub_total += amt
+    bal_usd = balance.get(chat_id)
+    debt_usd = debt.get(chat_id, 0)
+    topup_list = topups.get(chat_id) or []
+    has_data = bool(closed_orders) or bal_usd is not None or topup_list
+    summary = ["📊 *РЕЗУЛЬТАТ ДНЯ*", "━━━━━━━━━━━━━━━━━━━━"]
+    if rate:
+        summary.append(f"💱 Курс: {rate} ₽")
+    if closed_orders:
+        summary.append(f"✅ Исполнено заявок: {len(closed_orders)}")
+        if rub_total:
+            summary.append(f"💸 Прошло RUB: {int(rub_total):,} ₽".replace(",", " "))
+        if usd_total:
+            summary.append(f"💵 Прошло USD: {fmt_usd(usd_total)}")
+    else:
+        summary.append("ℹ️ Исполненных заявок не было")
+    if bal_usd is not None:
+        if rate:
+            rub_str = f"{round(bal_usd * rate):,}".replace(",", " ")
+            summary.append(f"💰 Баланс: {rub_str} ₽ / {fmt_usd(bal_usd)}")
+        else:
+            summary.append(f"💰 Баланс: {fmt_usd(bal_usd)}")
+    if topup_list:
+        summary.append(f"📥 Пополнений: {len(topup_list)}")
+    if debt_usd:
+        summary.append(f"📉 Остаток долга: {fmt_usd(debt_usd)}")
+    try:
+        await update.message.reply_text("\n".join(summary), parse_mode="Markdown")
+    except Exception as e:
+        await ctx.bot.send_message(chat_id=chat_id, text=f"⚠️ Ошибка вывода итогов: {e}")
+    if has_data:
+        try:
+            from telegram import InputFile
+            bio = build_excel_report(chat_id)
+            fname = f"report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            await ctx.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(bio, filename=fname),
+                caption="📊 Полный отчёт за день"
+            )
+        except Exception as e:
+            await ctx.bot.send_message(chat_id=chat_id, text=f"⚠️ Не удалось собрать Excel: {e}")
+    for d in (orders, current_rate, sessions, debt, last_bot_msg, last_list_msg, balance, bot_msgs, topups, last_bulk_close):
+        d.pop(chat_id, None)
     bot_active[chat_id] = False
-    await update.message.reply_text(
-        "⏸ *БОТ НА ПАУЗЕ* ⏸\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🛑 Приём новых заявок остановлен\n"
-        "💾 Текущие данные сохранены\n\n"
-        "▶️ Чтобы возобновить — /start",
-        parse_mode="Markdown"
-    )
+    try:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏸ *БОТ НА ПАУЗЕ* ⏸\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "🛑 Приём новых заявок остановлен\n"
+                "🧹 Память очищена\n\n"
+                "▶️ Чтобы начать заново — /start"
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
 
 async def cmd_start_active(update, ctx):
     chat_id = update.effective_chat.id
