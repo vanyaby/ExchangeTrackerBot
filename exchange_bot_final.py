@@ -1,6 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
-import os
 import logging
 import asyncio
 import re
@@ -22,9 +19,9 @@ MAIN_KB = ReplyKeyboardMarkup([[KeyboardButton('/list')]], resize_keyboard=True,
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-PROXYAPI_KEY = os.environ.get("PROXYAPI_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+TELEGRAM_TOKEN = "8703610648:AAFjK8QPtn-fc_HjUqH9P9xBOcH-7paWIzE"
+PROXYAPI_KEY = "sk-QoZ0giLmiwOy0W75vo3VDwnlGX617TbK"
+ANTHROPIC_API_KEY = "sk-zen-gen220f82209957d8f57bffb1ad51d0b"
 
 WAITING_RATE = 0
 orders = {}
